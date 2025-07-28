@@ -1,0 +1,115 @@
+version: '3.8'
+
+services:
+  # PostgreSQL Database
+  postgres:
+    image: postgres:15-alpine
+    container_name: rgm_postgres
+    environment:
+      POSTGRES_DB: rgm_analytics
+      POSTGRES_USER: rgm_user
+      POSTGRES_PASSWORD: rgm_password
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - rgm_network
+
+  # Redis Cache
+  redis:
+    image: redis:7-alpine
+    container_name: rgm_redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - rgm_network
+
+  # MongoDB (for unstructured data)
+  mongodb:
+    image: mongo:6
+    container_name: rgm_mongodb
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: rgm_user
+      MONGO_INITDB_ROOT_PASSWORD: rgm_password
+      MONGO_INITDB_DATABASE: rgm_analytics
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo_data:/data/db
+    networks:
+      - rgm_network
+
+  # FastAPI Application
+  api:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    container_name: rgm_api
+    environment:
+      - APP_ENV=development
+      - DB_HOST=postgres
+      - REDIS_HOST=redis
+      - MONGO_HOST=mongodb
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./src:/app/src
+      - ./data:/app/data
+    depends_on:
+      - postgres
+      - redis
+      - mongodb
+    networks:
+      - rgm_network
+    command: uvicorn src.api.main:app --host 0.0.0.0 --port 8000 --reload
+
+  # Streamlit Dashboard
+  dashboard:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    container_name: rgm_dashboard
+    environment:
+      - APP_ENV=development
+      - DB_HOST=postgres
+      - REDIS_HOST=redis
+    ports:
+      - "8501:8501"
+    volumes:
+      - ./dashboards:/app/dashboards
+      - ./data:/app/data
+    depends_on:
+      - api
+    networks:
+      - rgm_network
+    command: streamlit run dashboards/streamlit/app.py
+
+  # Jupyter Lab for development
+  jupyter:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    container_name: rgm_jupyter
+    environment:
+      - JUPYTER_ENABLE_LAB=yes
+    ports:
+      - "8888:8888"
+    volumes:
+      - ./notebooks:/app/notebooks
+      - ./data:/app/data
+      - ./src:/app/src
+    networks:
+      - rgm_network
+    command: jupyter lab --ip=0.0.0.0 --allow-root --no-browser
+
+volumes:
+  postgres_data:
+  redis_data:
+  mongo_data:
+
+networks:
+  rgm_network:
+    driver: bridge
