@@ -82,14 +82,25 @@ if len(viable_skus) > 0:
     print(f"Precio max: ${sku_data['PRECIO'].max():.2f}")
     print(f"Cantidad total: {sku_data['QTY_ENTREGADA'].sum():.0f}")
     
-    # Crear segmentos de precios simples
-    sku_data['Precio_Segment'] = pd.qcut(sku_data['PRECIO'], q=3, labels=False, duplicates='drop')
+    # Crear segmentos de precios usando percentiles más flexibles
+    price_unique = sku_data['PRECIO'].nunique()
+    if price_unique >= 5:
+        sku_data['Precio_Segment'] = pd.qcut(sku_data['PRECIO'], q=5, labels=False, duplicates='drop')
+    elif price_unique >= 3:
+        sku_data['Precio_Segment'] = pd.qcut(sku_data['PRECIO'], q=3, labels=False, duplicates='drop')
+    else:
+        # Usar bins fijos si hay pocos precios únicos
+        sku_data['Precio_Segment'] = pd.cut(sku_data['PRECIO'], bins=3, labels=False)
     
     # Agregar por segmento
     agg_data = sku_data.groupby('Precio_Segment').agg({
         'PRECIO': 'mean',
-        'QTY_ENTREGADA': 'sum'
+        'QTY_ENTREGADA': 'sum',
+        'IMPORTE': 'sum'
     }).reset_index()
+    
+    # Filtrar segmentos con datos válidos
+    agg_data = agg_data.dropna()
     
     print(f"\nDatos agregados por segmento:")
     for _, row in agg_data.iterrows():
@@ -128,4 +139,114 @@ if len(viable_skus) > 0:
 else:
     print("No hay productos viables con los criterios establecidos")
 
-print("\nTest completado exitosamente")
+# Calcular elasticidad para múltiples productos
+def calculate_elasticity_batch(df, skus_to_analyze):
+    """
+    Calcula elasticidad para múltiples SKUs
+    """
+    results = []
+    
+    for sku in skus_to_analyze:
+        try:
+            sku_data = df[df['SKU'] == sku].copy()
+            
+            # Crear segmentos dinámicamente
+            price_unique = sku_data['PRECIO'].nunique()
+            if price_unique < 3:
+                continue
+                
+            if price_unique >= 5:
+                sku_data['Precio_Segment'] = pd.qcut(sku_data['PRECIO'], q=5, labels=False, duplicates='drop')
+            else:
+                sku_data['Precio_Segment'] = pd.qcut(sku_data['PRECIO'], q=3, labels=False, duplicates='drop')
+            
+            # Agregar datos
+            agg_data = sku_data.groupby('Precio_Segment').agg({
+                'PRECIO': 'mean',
+                'QTY_ENTREGADA': 'sum'
+            }).reset_index().dropna()
+            
+            if len(agg_data) < 3 or agg_data['PRECIO'].std() == 0:
+                continue
+            
+            # Calcular elasticidad
+            log_price = np.log(agg_data['PRECIO'])
+            log_qty = np.log(agg_data['QTY_ENTREGADA'])
+            
+            X = log_price.values.reshape(-1, 1)
+            y = log_qty.values
+            
+            model = LinearRegression().fit(X, y)
+            elasticity = model.coef_[0]
+            r2 = model.score(X, y)
+            
+            # Categorizar
+            if elasticity < 0:
+                if elasticity > -0.5:
+                    categoria = "Inelástico"
+                elif elasticity > -1:
+                    categoria = "Poco Elástico"
+                elif elasticity > -2:
+                    categoria = "Elástico"
+                else:
+                    categoria = "Muy Elástico"
+            else:
+                categoria = "Anómalo (positivo)"
+            
+            results.append({
+                'SKU': sku,
+                'Elasticidad': elasticity,
+                'R2': r2,
+                'Categoria': categoria,
+                'Segmentos': len(agg_data),
+                'Transacciones': len(sku_data),
+                'Precio_Promedio': sku_data['PRECIO'].mean(),
+                'CV_Precio': sku_data['PRECIO'].std() / sku_data['PRECIO'].mean()
+            })
+            
+        except Exception as e:
+            continue
+    
+    return pd.DataFrame(results)
+
+# Calcular elasticidades para los top productos
+if len(viable_skus) > 0:
+    print(f"\n{'='*60}")
+    print("CALCULANDO ELASTICIDADES PARA MÚLTIPLES PRODUCTOS")
+    print(f"{'='*60}")
+    
+    top_skus = viable_skus.nlargest(10, 'CV')['SKU'].tolist()
+    elasticity_results = calculate_elasticity_batch(df_clean, top_skus)
+    
+    if len(elasticity_results) > 0:
+        # Filtrar resultados válidos
+        valid_results = elasticity_results[
+            (elasticity_results['R2'] > 0.3) &  # R² mínimo
+            (elasticity_results['Elasticidad'] < 0) &  # Elasticidad negativa
+            (elasticity_results['Elasticidad'] > -10)  # Elasticidad razonable
+        ]
+        
+        if len(valid_results) > 0:
+            print(f"\nProductos con elasticidad válida: {len(valid_results)}")
+            print("\nRESULTADOS DE ELASTICIDAD:")
+            print("-" * 100)
+            print(f"{'SKU':<15} {'Elasticidad':<12} {'R²':<8} {'Categoría':<15} {'Trans':<8} {'Precio$':<10}")
+            print("-" * 100)
+            
+            for _, row in valid_results.sort_values('Elasticidad').iterrows():
+                print(f"{row['SKU'][:14]:<15} {row['Elasticidad']:<12.3f} {row['R2']:<8.3f} {row['Categoria']:<15} {row['Transacciones']:<8.0f} {row['Precio_Promedio']:<10.2f}")
+            
+            # Estadísticas resumen
+            print(f"\nESTADISTICAS RESUMEN:")
+            print(f"   - Elasticidad promedio: {valid_results['Elasticidad'].mean():.3f}")
+            print(f"   - Elasticidad mediana: {valid_results['Elasticidad'].median():.3f}")
+            print(f"   - R² promedio: {valid_results['R2'].mean():.3f}")
+            print(f"   - Productos inelásticos (|E| < 1): {(valid_results['Elasticidad'] > -1).sum()}/{len(valid_results)}")
+            print(f"   - Productos elásticos (|E| > 1): {(valid_results['Elasticidad'] <= -1).sum()}/{len(valid_results)}")
+            
+        else:
+            print(">> No se encontraron productos con elasticidad válida después del filtrado")
+    else:
+        print(">> No se pudieron calcular elasticidades")
+
+print("\n>> Test completado exitosamente")
